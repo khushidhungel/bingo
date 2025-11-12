@@ -202,25 +202,90 @@ else:
             elif not genai_key:
                 st.error("Gemini API key not configured.")
             else:
-                try:
-                    # try common SDK call
-                    resp = genai.generate_text(model="models/text-bison-001", prompt=query)
-                    text = None
+                def call_genai_model(prompt, model="models/text-bison-001"):
+                    """Try several common call patterns for the google.generativeai package."""
+                    errors = []
+                    # pattern A: genai.generate_text(...)
+                    if hasattr(genai, "generate_text"):
+                        try:
+                            return genai.generate_text(model=model, prompt=prompt)
+                        except Exception as e:
+                            errors.append(f"generate_text: {e}")
+                    # pattern B: genai.generate(...)
+                    if hasattr(genai, "generate"):
+                        try:
+                            return genai.generate(model=model, prompt=prompt)
+                        except Exception as e:
+                            errors.append(f"generate: {e}")
+                    # pattern C: genai.models.generate(...)
+                    models_ns = getattr(genai, "models", None)
+                    if models_ns and hasattr(models_ns, "generate"):
+                        try:
+                            return models_ns.generate(model=model, input=prompt)
+                        except Exception as e:
+                            errors.append(f"models.generate: {e}")
+                    # pattern D: client class instance (Client or GenerativeAIClient)
+                    for cls_name in ("Client", "GenerativeAIClient"):
+                        cls = getattr(genai, cls_name, None)
+                        if cls:
+                            try:
+                                instance = cls(api_key=genai_key) if callable(cls) else cls()
+                                if hasattr(instance, "generate_text"):
+                                    return instance.generate_text(model=model, prompt=prompt)
+                                if hasattr(instance, "generate"):
+                                    return instance.generate(model=model, prompt=prompt)
+                            except Exception as e:
+                                errors.append(f"{cls_name}: {e}")
+                    raise Exception("No supported generate method found. Tried: " + " | ".join(errors))
+
+                def extract_text_from_response(resp):
+                    """Normalize common response shapes to a text string."""
+                    if resp is None:
+                        return None
+                    # object with attribute 'text' or 'output'
                     if hasattr(resp, "text"):
-                        text = resp.text
-                    elif isinstance(resp, dict):
-                        # attempt common dictionary shapes
-                        text = (resp.get("output") or resp.get("text") or
-                                (resp.get("candidates")[0].get("content") if resp.get("candidates") else None))
-                    st.write(text or "No text returned from model.")
-                except Exception:
-                    try:
-                        # fallback to older SDK style
-                        model = genai.GenerativeModel("gemini-pro")
-                        resp = model.generate_content(query)
-                        st.write(getattr(resp, "text", str(resp)))
-                    except Exception as e:
+                        return getattr(resp, "text")
+                    if hasattr(resp, "output"):
+                        return getattr(resp, "output")
+                    # dict-like shapes
+                    if isinstance(resp, dict):
+                        if "output" in resp and isinstance(resp["output"], str):
+                            return resp["output"]
+                        if "text" in resp and isinstance(resp["text"], str):
+                            return resp["text"]
+                        # candidates list (common in some SDKs)
+                        candidates = resp.get("candidates") or resp.get("outputs")
+                        if isinstance(candidates, list) and candidates:
+                            first = candidates[0]
+                            if isinstance(first, dict):
+                                return first.get("content") or first.get("text") or first.get("output")
+                            if isinstance(first, str):
+                                return first
+                    # some SDKs return a nested dict under 'response' or 'result'
+                    for key in ("response", "result"):
+                        if isinstance(resp, dict) and key in resp and isinstance(resp[key], dict):
+                            return extract_text_from_response(resp[key])
+                    return None
+
+                try:
+                    resp = call_genai_model(query, model="models/text-bison-001")
+                    text = extract_text_from_response(resp)
+                    if text:
+                        st.write(text)
+                    else:
+                        st.warning("No text returned from model. Raw response:")
+                        st.write(resp)
+                except Exception as e:
+                    msg = str(e)
+                    # detect model-not-found vs no-generate-method
+                    if "model not found" in msg.lower() or "not found" in msg.lower():
+                        st.error("AI call failed: model not available for this API/version. Try a supported model ID.")
+                    elif "no supported generate method" in msg.lower():
+                        st.error("AI SDK mismatch: the installed google.generativeai package does not expose a known generate method.")
+                        st.info("Update the package or consult its docs. For now, you can try installing a compatible client version.")
+                    else:
                         st.error(f"AI call failed: {e}")
+                    st.exception(e)
 
     elif choice == "Logout":
         st.session_state.logged_in = False
